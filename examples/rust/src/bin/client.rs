@@ -19,7 +19,10 @@ use {
         sync::Arc,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
-    tokio::{fs, sync::Mutex},
+    tokio::{
+        fs,
+        sync::{mpsc, Mutex},
+    },
     tonic::transport::{channel::ClientTlsConfig, Certificate},
     yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, Interceptor},
     yellowstone_grpc_proto::{
@@ -697,7 +700,7 @@ async fn geyser_health_watch(mut client: GeyserGrpcClient<impl Interceptor>) -> 
 }
 
 async fn geyser_subscribe(
-    mut client: GeyserGrpcClient<impl Interceptor>,
+    mut client: GeyserGrpcClient<impl Interceptor + 'static>,
     request: SubscribeRequest,
     resub: usize,
     stats: bool,
@@ -725,10 +728,47 @@ async fn geyser_subscribe(
     let mut pb_verify_c = verify_encoding.then_some((0, 0));
     let pb_verify = crate_progress_bar(&pb_multi, ProgressBarTpl::Verify)?;
 
-    let (mut subscribe_tx, mut stream) = client.subscribe_with_request(Some(request)).await?;
+    // let (mut subscribe_tx, mut stream) =
+    //     client.subscribe_with_request(Some(request.clone())).await?;
+
+    let (mut subscribe_tx, subscribe_rx) = futures::channel::mpsc::channel(1);
+    subscribe_tx
+        .send(request.clone())
+        .await
+        .map_err(GeyserGrpcClientError::SubscribeSendError)?;
+    let response: tonic::Response<
+        tonic::Streaming<yellowstone_grpc_proto::prelude::SubscribeUpdate>,
+    > = client.geyser.subscribe(subscribe_rx).await?;
+    let mut stream = response.into_inner();
 
     info!("stream opened");
-    let mut counter = 0;
+    // let mut counter = 0;
+
+    let pb_subsc = pb_multi.add(ProgressBar::no_length());
+    pb_subsc.set_style(ProgressStyle::with_template(
+        "{spinner} subscriptions: {pos}",
+    )?);
+    tokio::spawn({
+        let pb_multi = pb_multi.clone();
+        async move {
+            let mut ts = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                subscribe_tx
+                    .send(request.clone())
+                    .await
+                    .map_err(GeyserGrpcClientError::SubscribeSendError)
+                    .unwrap();
+                pb_subsc.inc(1);
+                pb_multi
+                    .println(format!("subscribed again... {:?}", ts.elapsed()))
+                    .unwrap();
+                ts = Instant::now();
+            }
+        }
+    });
+
     while let Some(message) = stream.next().await {
         match message {
             Ok(msg) => {
@@ -911,12 +951,12 @@ async fn geyser_subscribe(
                     Some(UpdateOneof::Ping(_)) => {
                         // This is necessary to keep load balancers that expect client pings alive. If your load balancer doesn't
                         // require periodic client pings then this is unnecessary
-                        subscribe_tx
-                            .send(SubscribeRequest {
-                                ping: Some(SubscribeRequestPing { id: 1 }),
-                                ..Default::default()
-                            })
-                            .await?;
+                        // subscribe_tx
+                        //     .send(SubscribeRequest {
+                        //         ping: Some(SubscribeRequestPing { id: 1 }),
+                        //         ..Default::default()
+                        //     })
+                        //     .await?;
                     }
                     Some(UpdateOneof::Pong(_)) => {}
                     None => {
@@ -932,28 +972,28 @@ async fn geyser_subscribe(
         }
 
         // Example to illustrate how to resubscribe/update the subscription
-        counter += 1;
-        if counter == resub {
-            let mut new_slots: SlotsFilterMap = HashMap::new();
-            new_slots.insert("client".to_owned(), SubscribeRequestFilterSlots::default());
+        // counter += 1;
+        // if counter == resub {
+        //     let mut new_slots: SlotsFilterMap = HashMap::new();
+        //     new_slots.insert("client".to_owned(), SubscribeRequestFilterSlots::default());
 
-            subscribe_tx
-                .send(SubscribeRequest {
-                    slots: new_slots.clone(),
-                    accounts: HashMap::default(),
-                    transactions: HashMap::default(),
-                    transactions_status: HashMap::default(),
-                    entry: HashMap::default(),
-                    blocks: HashMap::default(),
-                    blocks_meta: HashMap::default(),
-                    commitment: None,
-                    accounts_data_slice: Vec::default(),
-                    ping: None,
-                    from_slot: None,
-                })
-                .await
-                .map_err(GeyserGrpcClientError::SubscribeSendError)?;
-        }
+        //     subscribe_tx
+        //         .send(SubscribeRequest {
+        //             slots: new_slots.clone(),
+        //             accounts: HashMap::default(),
+        //             transactions: HashMap::default(),
+        //             transactions_status: HashMap::default(),
+        //             entry: HashMap::default(),
+        //             blocks: HashMap::default(),
+        //             blocks_meta: HashMap::default(),
+        //             commitment: None,
+        //             accounts_data_slice: Vec::default(),
+        //             ping: None,
+        //             from_slot: None,
+        //         })
+        //         .await
+        //         .map_err(GeyserGrpcClientError::SubscribeSendError)?;
+        // }
     }
     info!("stream closed");
     Ok(())

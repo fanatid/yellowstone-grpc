@@ -26,3 +26,4 @@ yellowstone-grpc-geyser/config-test.json
 
 # local files for development
 .local
+random-accounts.json
