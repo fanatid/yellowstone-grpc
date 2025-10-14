@@ -9,6 +9,7 @@ package geyser;
 
 service Geyser {
   rpc Subscribe(stream SubscribeRequest) returns (stream SubscribeUpdate) {}
+  rpc SubscribeAccounts(stream SubscribeAccountsRequest) returns (stream SubscribeUpdate) {}
   rpc SubscribeReplayInfo(SubscribeReplayInfoRequest) returns (SubscribeReplayInfoResponse) {}
   rpc Ping(PingRequest) returns (PongResponse) {}
   rpc GetLatestBlockhash(GetLatestBlockhashRequest) returns (GetLatestBlockhashResponse) {}
@@ -114,6 +115,14 @@ message SubscribeRequestAccountsDataSlice {
 
 message SubscribeRequestPing {
   int32 id = 1;
+}
+
+message SubscribeAccountsRequest {
+  optional int32 ping = 1;
+  optional uint64 from_slot = 2;
+  string filter = 3;
+  repeated bytes add = 4;
+  repeated bytes remove = 5;
 }
 
 message SubscribeUpdate {

@@ -38,6 +38,19 @@ fn main() -> anyhow::Result<()> {
         )
         .method(
             Method::builder()
+                .name("subscribe_accounts")
+                .route_name("SubscribeAccounts")
+                .input_type("crate::geyser::SubscribeAccountsRequest")
+                // .output_type("crate::geyser::SubscribeUpdate")
+                .output_type("crate::plugin::filter::message::FilteredUpdate")
+                .codec_path("tonic::codec::ProstCodec")
+                // .codec_path("crate::plugin::codec::SubscribeCodec")
+                .client_streaming()
+                .server_streaming()
+                .build(),
+        )
+        .method(
+            Method::builder()
                 .name("subscribe_first_available_slot")
                 .route_name("SubscribeReplayInfo")
                 .input_type("crate::geyser::SubscribeReplayInfoRequest")

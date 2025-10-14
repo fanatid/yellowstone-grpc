@@ -10,7 +10,7 @@ use {
     solana_clock::{Slot, MAX_RECENT_BLOCKHASHES},
     solana_pubkey::Pubkey,
     std::{
-        collections::{BTreeMap, HashMap},
+        collections::{BTreeMap, HashMap, HashSet},
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
             Arc,
@@ -20,7 +20,7 @@ use {
     tokio::{
         fs,
         runtime::Builder,
-        sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock, Semaphore},
+        sync::{broadcast, mpsc, oneshot, Mutex, MutexGuard, Notify, RwLock, Semaphore},
         task::spawn_blocking,
         time::{sleep, Duration, Instant},
     },
@@ -52,8 +52,9 @@ use {
             CommitmentLevel as CommitmentLevelProto, GetBlockHeightRequest, GetBlockHeightResponse,
             GetLatestBlockhashRequest, GetLatestBlockhashResponse, GetSlotRequest, GetSlotResponse,
             GetVersionRequest, GetVersionResponse, IsBlockhashValidRequest,
-            IsBlockhashValidResponse, PingRequest, PongResponse, SubscribeReplayInfoRequest,
-            SubscribeReplayInfoResponse, SubscribeRequest,
+            IsBlockhashValidResponse, PingRequest, PongResponse, SubscribeAccountsRequest,
+            SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest,
+            SubscribeRequestFilterAccounts, SubscribeRequestFilterSlots,
         },
     },
 };
@@ -1082,16 +1083,19 @@ impl GrpcService {
             }
         }
     }
-}
 
-#[tonic::async_trait]
-impl Geyser for GrpcService {
-    type SubscribeStream = ReceiverStream<TonicResult<FilteredUpdate>>;
-
-    async fn subscribe(
+    async fn subscribe2<T: Send + 'static>(
         &self,
-        mut request: Request<Streaming<SubscribeRequest>>,
-    ) -> TonicResult<Response<Self::SubscribeStream>> {
+        mut request: Request<Streaming<T>>,
+        get_ping: impl Fn(&T) -> Option<i32> + Send + 'static,
+        mut get_filter: impl for<'a> FnMut(
+                T,
+                &'a FilterLimits,
+                MutexGuard<'a, FilterNames>,
+            ) -> Result<(Option<Slot>, Filter), String>
+            + Send
+            + 'static,
+    ) -> TonicResult<Response<ReceiverStream<TonicResult<FilteredUpdate>>>> {
         let id = self.subscribe_id.fetch_add(1, Ordering::Relaxed);
 
         let x_request_snapshot = request.metadata().contains_key("x-request-snapshot");
@@ -1158,27 +1162,22 @@ impl Geyser for GrpcService {
                     }
                     message = request.get_mut().message() => match message {
                         Ok(Some(request)) => {
+                            if let Some(id) = get_ping(&request) {
+                                let msg = FilteredUpdate::new_empty(FilteredUpdateOneof::pong(id));
+                                if incoming_stream_tx.send(Ok(msg)).await.is_err() {
+                                    error!("client #{id}: stream closed");
+                                    let _ = incoming_client_tx.send(None);
+                                    break;
+                                }
+                            }
+
                             let mut filter_names = filter_names.lock().await;
                             filter_names.try_clean();
 
-                            if let Err(error) = match Filter::new(&request, &config_filter_limits, &mut filter_names) {
-                                Ok(filter) => {
-                                    if let Some(msg) = filter.get_pong_msg() {
-                                        if incoming_stream_tx.send(Ok(msg)).await.is_err() {
-                                            error!("client #{id}: stream closed");
-                                            let _ = incoming_client_tx.send(None);
-                                            break;
-                                        }
-                                        continue;
-                                    }
+                            let result = get_filter(request, &config_filter_limits, filter_names)
+                                .map(|(from_slot, filter)| incoming_client_tx.send(Some((from_slot, filter))).map_err(|error| error.to_string()));
 
-                                    match incoming_client_tx.send(Some((request.from_slot, filter))) {
-                                        Ok(()) => Ok(()),
-                                        Err(error) => Err(error.to_string()),
-                                    }
-                                },
-                                Err(error) => Err(error.to_string()),
-                            } {
+                            if let Err(error) = result {
                                 let err = Err(Status::invalid_argument(format!(
                                     "failed to create filter: {error}"
                                 )));
@@ -1215,6 +1214,82 @@ impl Geyser for GrpcService {
         ));
 
         Ok(Response::new(ReceiverStream::new(stream_rx)))
+    }
+}
+
+#[tonic::async_trait]
+impl Geyser for GrpcService {
+    type SubscribeStream = ReceiverStream<TonicResult<FilteredUpdate>>;
+    type SubscribeAccountsStream = ReceiverStream<TonicResult<FilteredUpdate>>;
+
+    async fn subscribe(
+        &self,
+        request: Request<Streaming<SubscribeRequest>>,
+    ) -> TonicResult<Response<Self::SubscribeStream>> {
+        self.subscribe2(
+            request,
+            |request| request.ping.map(|msg| msg.id),
+            |request, config_filter_limits, mut filter_names| {
+                Filter::new(&request, config_filter_limits, &mut filter_names)
+                    .map(|filter| (request.from_slot, filter))
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    async fn subscribe_accounts(
+        &self,
+        request: Request<Streaming<SubscribeAccountsRequest>>,
+    ) -> TonicResult<Response<Self::SubscribeAccountsStream>> {
+        fn try_conv(pubkeys: Vec<Vec<u8>>) -> impl Iterator<Item = Result<Pubkey, String>> {
+            pubkeys.into_iter().map(|bytes| {
+                let slice: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| "invalid pubkey len".to_owned())?;
+                Ok(Pubkey::from(slice))
+            })
+        }
+
+        let mut pubkeys = HashSet::new();
+        self.subscribe2(
+            request,
+            |request| request.ping,
+            move |request, config_filter_limits, mut filter_names| {
+                Ok(&mut pubkeys)
+                    .and_then(|pubkeys| {
+                        for item in try_conv(request.add) {
+                            pubkeys.insert(item?);
+                        }
+                        for item in try_conv(request.remove) {
+                            pubkeys.remove(&item?);
+                        }
+                        Ok(pubkeys)
+                    })
+                    .and_then(|pubkeys| {
+                        let request2 = SubscribeRequest {
+                            slots: [(request.filter, SubscribeRequestFilterSlots::default())]
+                                .into_iter()
+                                .collect(),
+                            accounts: [(
+                                "".to_owned(),
+                                SubscribeRequestFilterAccounts {
+                                    account: pubkeys.iter().map(|pk| pk.to_string()).collect(),
+                                    ..Default::default()
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                            ..Default::default()
+                        };
+
+                        Filter::new(&request2, config_filter_limits, &mut filter_names)
+                            .map(|filter| (request.from_slot, filter))
+                            .map_err(|error| error.to_string())
+                    })
+            },
+        )
+        .await
     }
 
     async fn subscribe_first_available_slot(
